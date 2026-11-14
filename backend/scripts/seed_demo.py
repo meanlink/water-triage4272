@@ -2,9 +2,11 @@ import time, json
 from sqlalchemy import select, func
 from src.config.database import Session
 from migrations.initial import migrate
-from src.models import User, Dataset, Job, Report, Delivery, Audit
-from src.services.business import metadata, seed_records, analyze
+from src.models import User, Dataset, Job, Report, Delivery, Audit, PatrolBatch, Dispatch
+from src.services.business import metadata, seed_records, analyze, FEATURES
 from src.services.reports import deliver
+from src.services import patrol as patrol_service
+from src.services.triage_rule import validate_patrol_records
 from src.utils.security import hash_password
 from src.utils.serialization import checksum
 def seed():
@@ -31,8 +33,28 @@ def seed():
             r=Report(name='每日业务复核简报',job_id=j.id,destination='业务复核组 · 本地收件箱',interval_seconds=86400,next_run=time.time()+86400,enabled=True)
             db.add(r);db.flush();deliver(db,r)
             db.add(Audit(actor='seed',action='demo.baseline',detail={'dataset':d.id},at=time.time()))
+        # 无标签待巡批次与首周派单：仅用已批准试验的规则快照，不重新训练。
+        baseline=db.scalar(select(Job).where(Job.name=='基线复核 · '+m['name']))
+        patrol_name='城东无标签待巡批次 · 2026-11'
+        pb=db.scalar(select(PatrolBatch).where(PatrolBatch.name==patrol_name))
+        if not pb:
+            raw=seed_records()
+            unlabeled=[{'segment_id':f"NC-P{i+1:03}", **{k: r[k] for k in FEATURES}} for i,r in enumerate(raw[:90])]
+            clean=validate_patrol_records(unlabeled)
+            admin=db.scalar(select(User).where(User.role=='admin'))
+            pb=PatrolBatch(name=patrol_name,source='patrol-2026-11-unlabeled.csv',records=clean,
+                           checksum=checksum(clean),created_by=admin.id,created_at=time.time()-1800)
+            db.add(pb);db.flush()
+        if baseline and baseline.result.get('rule_artifact') and not db.scalar(select(Dispatch).where(Dispatch.name=='首周巡检派单 · 原规则快照')):
+            admin=db.scalar(select(User).where(User.role=='admin'))
+            class _Data: pass
+            payload=_Data(); payload.name='首周巡检派单 · 原规则快照'; payload.job_id=baseline.id
+            payload.patrol_batch_id=pb.id; payload.quota=12
+            dispatch=patrol_service.create_dispatch(db,payload,admin)
+            patrol_service.write_dispatch_files(dispatch)
+            db.add(Audit(actor='seed',action='demo.dispatch',detail={'dispatch':dispatch.id},at=time.time()))
         db.commit()
-        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in [User,Dataset,Job,Report,Delivery,Audit]}
+        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in [User,Dataset,Job,Report,Delivery,Audit,PatrolBatch,Dispatch]}
         print(json.dumps(counts,ensure_ascii=False))
         return counts
 if __name__=='__main__':seed()

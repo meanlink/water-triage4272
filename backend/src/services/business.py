@@ -4,6 +4,8 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 
+from src.services.triage_rule import export_rule_artifact, format_rule_path, artifact_rule_path
+
 FEATURES = ["night_flow", "pressure_drop", "acoustic_db", "pipe_age"]
 LABELS = ["夜间流量(m³/h)", "压力降(kPa)", "声学读数(dB)", "管龄(年)"]
 
@@ -20,6 +22,8 @@ def metadata():
         "entities": ["管段复核样本", "分诊规则试验", "巡检复核简报"],
         "dataset_name": "城北管段夜间流量与已复核标签",
         "columns": [{"key": "segment_id", "label": "管段编号", "type": "string"}] + [{"key": k, "label": l, "type": "number"} for k, l in zip(FEATURES, LABELS)] + [{"key": "confirmed_leak", "label": "复核漏点(1/0)", "type": "number"}],
+        "patrol_columns": [{"key": "segment_id", "label": "管段编号", "type": "string"}] + [{"key": k, "label": l, "type": "number"} for k, l in zip(FEATURES, LABELS)],
+        "patrol_note": "待巡批次无 confirmed_leak 标签；坏行或重复编号整批拒绝。派单冻结当时的规则快照与输入指纹，后续试验和批次变化不改变已派结果。",
         "parameters": [{"key": "max_depth", "label": "决策树最大深度", "type": "number", "default": 3, "min": 1, "max": 8}, {"key": "min_leaf", "label": "叶节点最少样本", "type": "number", "default": 5, "min": 2, "max": 20}],
         "workbench_title": "漏损分诊规则试验", "action_label": "训练并核验分诊规则", "unit": "段管线",
         "accent": "oklch(48% 0.10 210)", "style": "blueprint",
@@ -74,15 +78,30 @@ def analyze(records, params):
     recall = float(recall_score(y[valid], prediction, zero_division=0))
     f1 = float(f1_score(y[valid], prediction, zero_division=0))
     tn, fp, fn, tp = [int(v) for v in confusion_matrix(y[valid], prediction, labels=[0, 1]).ravel()]
+    rule_artifact = export_rule_artifact(model, {"max_depth": depth, "min_leaf": leaf})
     order = np.argsort(-probability)
-    rows = [{"segment_id": str(records[int(valid[j])].get("segment_id", f"row-{int(valid[j])+1}")), "risk_pct": round(float(probability[j]) * 100, 1), "triage": "优先听漏复核" if prediction[j] else "常规巡查", "actual": "已确认漏点" if y[valid[j]] else "已确认正常"} for j in order]
+    rows = []
+    for j in order:
+        row_index = int(valid[j])
+        leaf_id = int(model.apply(x[row_index:row_index + 1])[0])
+        values = [float(records[row_index][k]) for k in FEATURES]
+        path_text = format_rule_path(artifact_rule_path(rule_artifact, values))
+        rows.append({
+            "segment_id": str(records[row_index].get("segment_id", f"row-{row_index + 1}")),
+            "risk_pct": round(float(probability[j]) * 100, 1),
+            "triage": "优先听漏复核" if prediction[j] else "常规巡查",
+            "actual": "已确认漏点" if y[valid[j]] else "已确认正常",
+            "leaf_node": leaf_id,
+            "rule_path": path_text,
+        })
     important = int(np.argmax(model.feature_importances_))
     first_rule = export_text(model, feature_names=FEATURES).splitlines()[0].strip()
     return {
         "summary": f"{len(train)}段训练、{len(valid)}段独立验证；实际树深{model.get_depth()}，生成{model.get_n_leaves()}个可复核叶节点。",
         "metrics": [{"label": "验证F1", "value": round(f1, 4)}, {"label": "漏点召回率", "value": round(recall * 100, 2), "unit": "%"}, {"label": "分诊精确率", "value": round(precision * 100, 2), "unit": "%"}, {"label": "验证漏检", "value": fn, "unit": "段"}],
-        "table": {"columns": [{"key": "segment_id", "label": "管段"}, {"key": "risk_pct", "label": "叶节点漏点率(%)"}, {"key": "triage", "label": "分诊建议"}, {"key": "actual", "label": "留出集复核结果"}], "rows": rows},
+        "table": {"columns": [{"key": "segment_id", "label": "管段"}, {"key": "risk_pct", "label": "叶节点漏点率(%)"}, {"key": "triage", "label": "分诊建议"}, {"key": "actual", "label": "留出集复核结果"}, {"key": "leaf_node", "label": "命中叶节点"}, {"key": "rule_path", "label": "命中规则路径"}], "rows": rows},
         "chart": {"type": "bar", "labels": LABELS, "series": [{"name": "Gini分裂重要性", "values": [round(float(v), 4) for v in model.feature_importances_]}]},
         "findings": [f"验证混淆矩阵：命中漏点{tp}、误报{fp}、漏检{fn}、正确排除{tn}。", f"模型最重视{LABELS[important]}；根节点规则：{first_rule}。", "调高树深可能拟合局部噪声；只依据留出F1和漏检率选择规则复杂度。"],
         "method": metadata()["method"], "warnings": ["分诊规则仅辅助现场巡检，不作为自动停水或施工决策。"],
+        "rule_artifact": rule_artifact,
     }
